@@ -2,8 +2,8 @@
 name = "sfp"
 version = "0.1.0"
 edition = "2021"
-description = "SFP (Segment Flow Protocol) - NACK-based block assembly protocol over UDP"
-authors = ["SFP Protocol Team"]
+description = "SFP (Segmented Forward Protocol) - A UDP-based NACK-driven block-assembly transmission protocol"
+authors = ["Rero0124"]
 license = "MIT"
 repository = "https://github.com/rero0124/sfp"
 keywords = ["udp", "protocol", "nack", "file-transfer", "congestion-control"]
