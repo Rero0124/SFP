@@ -157,6 +157,15 @@ pub struct SegmentCompleteMessage {
 }
 
 impl SegmentCompleteMessage {
+    pub fn new(segment_id: SegmentId, total_chunks_received: u32, elapsed_ms: u64) -> Self {
+        Self {
+            segment_id,
+            total_chunks_received,
+            duplicates_received: 0,
+            elapsed_ms,
+        }
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let payload = bincode::serialize(self).unwrap_or_default();
         let header = MessageHeader::new(MessageType::SegmentComplete, payload.len() as u32);
@@ -166,6 +175,22 @@ impl SegmentCompleteMessage {
         buf.extend_from_slice(&header_bytes);
         buf.extend_from_slice(&payload);
         buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 10 {
+            return None;
+        }
+        let header: MessageHeader = bincode::deserialize(bytes).ok()?;
+        if header.msg_type != MessageType::SegmentComplete {
+            return None;
+        }
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+        if bytes.len() < header_size {
+            return None;
+        }
+        bincode::deserialize(&bytes[header_size..]).ok()
     }
 }
 

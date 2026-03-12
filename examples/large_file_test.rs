@@ -24,7 +24,7 @@ use tracing_subscriber::FmtSubscriber;
 use sfp::bbr::BbrLite;
 use sfp::chunk::SegmentBuilder;
 use sfp::crypto::{CryptoSession, EphemeralKeyPair, KeyExchangeMessage};
-use sfp::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage};
+use sfp::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage, SegmentCompleteMessage};
 use sfp::Config;
 
 /// 테스트용 텍스트 데이터 생성
@@ -412,10 +412,8 @@ async fn run_server(
                                 continue;
                             }
                             MessageType::SegmentComplete => {
-                                if data.len() > 20 {
-                                    if let Ok(seg_id) = bincode::deserialize::<u64>(&data[16..24]) {
-                                        disp_completed.write().await.insert(seg_id);
-                                    }
+                                if let Some(msg) = sfp::message::SegmentCompleteMessage::from_bytes(&data) {
+                                    disp_completed.write().await.insert(msg.segment_id);
                                 }
                                 continue;
                             }
@@ -756,6 +754,8 @@ async fn run_client(
         let assembled_tx = assembled_tx.clone();
         let chunks_count = total_chunks_received.clone();
         let worker_running = running.clone();
+        let worker_send_tx = send_tx.clone();
+        let worker_start = start;
         
         let handle = tokio::spawn(async move {
             loop {
@@ -810,6 +810,15 @@ async fn run_client(
                         
                         assembled.write().await.insert(segment_id);
                         let _ = assembled_tx.try_send((segment_id, segment_data));
+                        
+                        // 서버에 세그먼트 완료 알림 전송
+                        let elapsed_ms = worker_start.elapsed().as_millis() as u64;
+                        let complete_msg = SegmentCompleteMessage::new(
+                            segment_id,
+                            total_chunks as u32,
+                            elapsed_ms,
+                        );
+                        let _ = worker_send_tx.try_send(complete_msg.to_bytes());
                     }
                 }
             }
