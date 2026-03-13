@@ -150,6 +150,14 @@ impl BbrLite {
             return;
         }
 
+        // 수신자 피드백이 아직 없으면 initial_rate 유지 (rate 변경하지 않음)
+        // 피드백 없이 송신자 측 delivery_rate로 계산하면 자기참조 순환으로 폭주함
+        if self.receiver_delivery_rate <= 0.0 {
+            self.delivered_prev = self.delivered_bytes;
+            self.last_ts = now;
+            return;
+        }
+
         // 1. 송신자 측 delivery rate 계산 (bytes/sec)
         let delivered = self.delivered_bytes.saturating_sub(self.delivered_prev);
         let sender_delivery_rate = if dt > 0.0 && delivered > 0 {
@@ -161,17 +169,8 @@ impl BbrLite {
         self.delivered_prev = self.delivered_bytes;
         self.last_ts = now;
 
-        // 2. delivery rate 결정
-        //    수신자가 보고한 raw recv rate (소켓 수신 대역폭)가 있으면
-        //    그것이 실제 bottleneck bandwidth → max_bw에 반영
-        //    송신자 측 delivery_rate는 자기 pacing에 갇히므로 보조로만 사용
-        let delivery_rate = if self.receiver_delivery_rate > 0.0 {
-            // 수신자 피드백이 있으면 그것이 실제 대역폭
-            self.receiver_delivery_rate
-        } else {
-            // 피드백 없으면 송신자 측 사용 (초기 Startup 등)
-            sender_delivery_rate
-        };
+        // 2. delivery rate 결정: 수신자 raw recv rate가 실제 대역폭
+        let delivery_rate = self.receiver_delivery_rate;
 
         // 3. Windowed max bandwidth 업데이트
         self.update_max_bw(delivery_rate);
