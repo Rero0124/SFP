@@ -525,29 +525,26 @@ async fn run_server(
                     }
                 };
                 
-                // NACK 수신 → 손실률 기반 혼잡 감지 (RTT 팽창 대신)
-                {
-                    let mut guard = b.lock().await;
-                    // NACK의 missing chunk 수로 손실률 추정
-                    let loss_ratio = nack.missing_chunk_ids.len() as f64 / 55.0; // ~55 chunks/segment
-                    guard.on_loss_update(loss_ratio);
-                    guard.update_rate();
-                }
-                
+                // 재전송도 BBR pacing 적용 — burst 방지
                 let cache = chunks_cache.read().await;
                 if let Some(chunks) = cache.get(&nack.segment_id) {
-                    let mut retrans_bytes = 0usize;
                     for &chunk_id in &nack.missing_chunk_ids {
                         if let Some(chunk) = chunks.get(chunk_id as usize) {
                             let bytes = chunk.to_bytes();
-                            retrans_bytes += bytes.len();
+                            let byte_len = bytes.len();
                             let _ = tx.send((bytes, client_addr)).await;
                             send_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            // BBR pacing: budget 소진 시 interval만큼 대기
+                            let mut guard = b.lock().await;
+                            guard.on_packet_sent(byte_len);
+                            guard.update_rate();
+                            let budget = guard.bytes_per_interval(Duration::from_millis(10));
+                            drop(guard);
+                            if byte_len >= budget {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
                         }
-                    }
-                    if retrans_bytes > 0 {
-                        let mut guard = b.lock().await;
-                        guard.on_packet_sent(retrans_bytes);
                     }
                 }
             }
