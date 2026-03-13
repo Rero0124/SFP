@@ -317,6 +317,10 @@ impl BbrLite {
     /// - loss 5~20%: base + loss * 2.5 (적극적 증가)
     /// - loss > 20%: max_redundancy에 가까이
     pub fn recommended_redundancy(&self, base: f64, min: f64, max: f64) -> f64 {
+        // 수신자 피드백 없으면 base redundancy 유지 (피드백 전에 min으로 낮추지 않음)
+        if self.receiver_delivery_rate <= 0.0 {
+            return base;
+        }
         if self.loss_rate < 0.001 {
             // 손실이 거의 없으면 redundancy를 최소로 → 대역폭을 속도에 활용
             return min;

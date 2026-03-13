@@ -147,14 +147,25 @@ async fn run_server(
     let recv_rx = Arc::new(tokio::sync::Mutex::new(recv_rx));
     
     let recv_socket = socket.clone();
+    let recv_drop_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let recv_drop_log = recv_drop_count.clone();
     let _recv_task = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
+        let mut err_count = 0u64;
         loop {
             match recv_socket.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
-                    let _ = recv_tx.try_send((buf[..len].to_vec(), addr));
+                    if recv_tx.try_send((buf[..len].to_vec(), addr)).is_err() {
+                        recv_drop_log.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    err_count += 1;
+                    if err_count % 1000 == 1 {
+                        eprintln!("⚠️ recv_task 에러 #{}", err_count);
+                    }
+                    continue;
+                }
             }
         }
     });
@@ -246,65 +257,150 @@ async fn run_server(
     let bbr = Arc::new(tokio::sync::Mutex::new(BbrLite::new(initial_rtt, initial_rate)));
     let segments_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let sending_active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    
-    // FlowControl 피드백 태스크 (BBR 업데이트)
-    let fc_bbr = bbr.clone();
-    let fc_sending = sending_active.clone();
-    let fc_recv_rx = recv_rx.clone();
-    let fc_base_redundancy = config.base_redundancy_ratio;
-    let fc_min_redundancy = config.min_redundancy_ratio;
-    let fc_max_redundancy = config.max_redundancy_ratio;
 
-    let _fc_task = tokio::spawn(async move {
-        let mut last_log = Instant::now();
+    // NACK 처리 준비 (sending 중에도 수신 메시지를 처리하기 위해 미리 시작)
+    let retransmit_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let last_nack_time = Arc::new(tokio::sync::RwLock::new(Instant::now()));
+    let completed_segments: Arc<tokio::sync::RwLock<std::collections::HashSet<u64>>> =
+        Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
+    let nack_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-        while fc_sending.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut rx = fc_recv_rx.lock().await;
-            match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-                Ok(Some((data, _addr))) => {
+    let (nack_tx, nack_rx) = mpsc::channel::<NackMessage>(10000);
+    let nack_rx = Arc::new(tokio::sync::Mutex::new(nack_rx));
+
+    // 통합 디스패처 (Init, SegmentComplete, NACK, FlowControl 모두 처리)
+    // sending 중에도 실행하여 메시지 유실 방지
+    let disp_running = nack_running.clone();
+    let disp_last_nack = last_nack_time.clone();
+    let disp_completed = completed_segments.clone();
+    let ack_bytes = ack.to_bytes();
+    let priority_tx_disp = priority_tx.clone();
+    let recv_rx_disp = recv_rx.clone();
+    let disp_bbr = bbr.clone();
+    let disp_base_redundancy = config.base_redundancy_ratio;
+    let disp_min_redundancy = config.min_redundancy_ratio;
+    let disp_max_redundancy = config.max_redundancy_ratio;
+
+    let dispatcher_task = tokio::spawn(async move {
+        let mut last_bbr_log = Instant::now();
+
+        while disp_running.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut rx = recv_rx_disp.lock().await;
+            match tokio::time::timeout(Duration::from_millis(10), rx.recv()).await {
+                Ok(Some((data, addr))) => {
                     drop(rx);
 
-                    // FlowControl 메시지 → BBR 업데이트
+                    // 메시지 타입별 처리
+                    if let Ok(header) = bincode::deserialize::<MessageHeader>(&data[..data.len().min(32)]) {
+                        match header.msg_type {
+                            MessageType::Init => {
+                                let _ = priority_tx_disp.try_send((ack_bytes.clone(), addr));
+                                continue;
+                            }
+                            MessageType::SegmentComplete => {
+                                if let Some(msg) = sfp::message::SegmentCompleteMessage::from_bytes(&data) {
+                                    disp_completed.write().await.insert(msg.segment_id);
+                                }
+                                continue;
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    // FlowControl 처리 → BBR 업데이트
                     if let Some(fc) = FlowControlMessage::from_bytes(&data) {
-                        let mut b = fc_bbr.lock().await;
-
-                        // 손실률 업데이트
+                        let mut b = disp_bbr.lock().await;
                         b.on_loss_update(fc.loss_rate as f64);
-
-                        // 수신자 측 delivery rate 업데이트
-                        // processing_rate = raw recv bytes/sec (소켓 수신 대역폭)
                         if fc.processing_rate > 0.0 {
                             b.on_receiver_rate_update(fc.processing_rate as f64);
                         }
-
-                        // RTT 추정: 큐에 쌓인 세그먼트 기반
                         if fc.segments_in_progress > 0 {
                             let queue_delay = fc.segments_in_progress as f64 * 0.0005;
-                            let estimated_rtt = 0.001 + queue_delay;
-                            b.on_rtt_update(estimated_rtt);
+                            b.on_rtt_update(0.001 + queue_delay);
                         } else {
                             b.on_rtt_update(0.001);
                         }
-
                         b.update_rate();
-
-                        if last_log.elapsed() > Duration::from_millis(500) {
+                        if last_bbr_log.elapsed() > Duration::from_millis(500) {
                             let dyn_redundancy = b.recommended_redundancy(
-                                fc_base_redundancy, fc_min_redundancy, fc_max_redundancy);
+                                disp_base_redundancy, disp_min_redundancy, disp_max_redundancy);
                             info!("📶 BBR state:{:?} rate:{:.0}MB/s bw:{:.0}MB/s rtt:{:.2}ms loss:{:.1}% redundancy:{:.0}%",
                                 b.state, b.pacing_rate / 1024.0 / 1024.0,
                                 b.max_bw / 1024.0 / 1024.0,
                                 b.min_rtt * 1000.0, b.loss_rate * 100.0,
                                 dyn_redundancy * 100.0);
-                            last_log = Instant::now();
+                            last_bbr_log = Instant::now();
                         }
+                        continue;
+                    }
+
+                    // NACK 처리
+                    if let Some(nack) = NackMessage::from_bytes(&data) {
+                        *disp_last_nack.write().await = Instant::now();
+                        let _ = nack_tx.try_send(nack);
                     }
                 }
-                _ => { drop(rx); }
+                Ok(None) => break,
+                Err(_) => { drop(rx); continue; }
             }
         }
     });
-    
+
+    // NACK 재전송 workers
+    let send_count = retransmit_count.clone();
+    let num_process_workers = 4;
+    let mut process_handles = Vec::new();
+    let nack_bbr = bbr.clone();
+
+    for _worker_id in 0..num_process_workers {
+        let rx = nack_rx.clone();
+        let chunks_cache = segment_chunks.clone();
+        let tx = data_tx.clone();
+        let worker_running = nack_running.clone();
+        let send_counter = send_count.clone();
+        let b = nack_bbr.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let nack = {
+                    let mut rx_guard = rx.lock().await;
+                    match tokio::time::timeout(Duration::from_millis(50), rx_guard.recv()).await {
+                        Ok(Some(nack)) => nack,
+                        Ok(None) => break,
+                        Err(_) => {
+                            if !worker_running.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                };
+
+                let cache = chunks_cache.read().await;
+                if let Some(chunks) = cache.get(&nack.segment_id) {
+                    for &chunk_id in &nack.missing_chunk_ids {
+                        if let Some(chunk) = chunks.get(chunk_id as usize) {
+                            let bytes = chunk.to_bytes();
+                            let byte_len = bytes.len();
+                            let _ = tx.send((bytes, client_addr)).await;
+                            send_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                            let mut guard = b.lock().await;
+                            guard.on_packet_sent(byte_len);
+                            guard.update_rate();
+                            let budget = guard.bytes_per_interval(Duration::from_millis(10));
+                            drop(guard);
+                            if byte_len >= budget {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        process_handles.push(handle);
+    }
+
     // 데이터 전송 (pacing 적용)
     let tx = data_tx.clone();
     let start = Instant::now();
@@ -437,121 +533,13 @@ async fn run_server(
     }
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-    // NACK 처리
-    let nack_wait_secs = ((data.len() as u64 / (5 * 1024 * 1024)) + 60).max(120);
+    // NACK 대기
+    let nack_wait_secs = ((data.len() as u64 / (1 * 1024 * 1024)) + 120).max(300);
     info!("⏳ NACK 대기 및 재전송 중 (최대 {}초)...", nack_wait_secs);
-    
-    let retransmit_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let last_nack_time = Arc::new(tokio::sync::RwLock::new(Instant::now()));
-    let completed_segments: Arc<tokio::sync::RwLock<std::collections::HashSet<u64>>> = 
-        Arc::new(tokio::sync::RwLock::new(std::collections::HashSet::new()));
-    let nack_running = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    
-    let (nack_tx, nack_rx) = mpsc::channel::<NackMessage>(10000);
-    let nack_rx = Arc::new(tokio::sync::Mutex::new(nack_rx));
-    
-    // NACK 처리 디스패처 (Init, SegmentComplete, NACK만 처리)
-    let disp_running = nack_running.clone();
-    let disp_last_nack = last_nack_time.clone();
-    let disp_completed = completed_segments.clone();
-    let ack_bytes = ack.to_bytes();
-    let priority_tx_disp = priority_tx.clone();
-    let recv_rx_disp = recv_rx.clone();
-    
-    let dispatcher_task = tokio::spawn(async move {
-        while disp_running.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut rx = recv_rx_disp.lock().await;
-            match tokio::time::timeout(Duration::from_millis(10), rx.recv()).await {
-                Ok(Some((data, addr))) => {
-                    drop(rx);
-                    
-                    // 메시지 타입별 처리
-                    if let Ok(header) = bincode::deserialize::<MessageHeader>(&data[..data.len().min(32)]) {
-                        match header.msg_type {
-                            MessageType::Init => {
-                                let _ = priority_tx_disp.try_send((ack_bytes.clone(), addr));
-                                continue;
-                            }
-                            MessageType::SegmentComplete => {
-                                if let Some(msg) = sfp::message::SegmentCompleteMessage::from_bytes(&data) {
-                                    disp_completed.write().await.insert(msg.segment_id);
-                                }
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    
-                    // NACK 처리
-                    if let Some(nack) = NackMessage::from_bytes(&data) {
-                        *disp_last_nack.write().await = Instant::now();
-                        let _ = nack_tx.try_send(nack);
-                    }
-                }
-                Ok(None) => break,
-                Err(_) => { drop(rx); continue; }
-            }
-        }
-    });
-    
-    let send_count = retransmit_count.clone();
-    let num_process_workers = 4;
-    let mut process_handles = Vec::new();
-    
-    // NACK 재전송에도 BBR pacing 적용
-    let nack_bbr = bbr.clone();
-    
-    for _worker_id in 0..num_process_workers {
-        let rx = nack_rx.clone();
-        let chunks_cache = segment_chunks.clone();
-        let tx = data_tx.clone();
-        let worker_running = nack_running.clone();
-        let send_counter = send_count.clone();
-        let b = nack_bbr.clone();
-        
-        let handle = tokio::spawn(async move {
-            loop {
-                let nack = {
-                    let mut rx_guard = rx.lock().await;
-                    match tokio::time::timeout(Duration::from_millis(50), rx_guard.recv()).await {
-                        Ok(Some(nack)) => nack,
-                        Ok(None) => break,
-                        Err(_) => {
-                            if !worker_running.load(std::sync::atomic::Ordering::Relaxed) {
-                                break;
-                            }
-                            continue;
-                        }
-                    }
-                };
-                
-                // 재전송도 BBR pacing 적용 — burst 방지
-                let cache = chunks_cache.read().await;
-                if let Some(chunks) = cache.get(&nack.segment_id) {
-                    for &chunk_id in &nack.missing_chunk_ids {
-                        if let Some(chunk) = chunks.get(chunk_id as usize) {
-                            let bytes = chunk.to_bytes();
-                            let byte_len = bytes.len();
-                            let _ = tx.send((bytes, client_addr)).await;
-                            send_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                            // BBR pacing: budget 소진 시 interval만큼 대기
-                            let mut guard = b.lock().await;
-                            guard.on_packet_sent(byte_len);
-                            guard.update_rate();
-                            let budget = guard.bytes_per_interval(Duration::from_millis(10));
-                            drop(guard);
-                            if byte_len >= budget {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-        process_handles.push(handle);
-    }
-    
+    // last_nack_time 리셋 (sending 완료 시점 기준으로)
+    *last_nack_time.write().await = Instant::now();
+
     // 모니터링 루프
     let nack_start = Instant::now();
     let mut last_log_time = Instant::now();
@@ -564,7 +552,8 @@ async fn run_server(
         let retrans = retransmit_count.load(std::sync::atomic::Ordering::Relaxed);
         
         if last_log_time.elapsed() > Duration::from_secs(2) && retrans > 0 {
-            info!("📨 재전송 진행: {} 청크 | 완료: {}/{}", retrans, completed_count, total_segments);
+            let drops = recv_drop_count.load(std::sync::atomic::Ordering::Relaxed);
+            info!("📨 재전송 진행: {} 청크 | 완료: {}/{} | recv_drops: {}", retrans, completed_count, total_segments, drops);
             last_log_time = Instant::now();
         }
         
@@ -739,9 +728,9 @@ async fn run_client(
     };
     info!("📊 RTT: {}μs → 추정 대역폭: {:.0} MB/s", rtt_us, estimated_bandwidth_mbps);
     
-    // 초기 FlowControl 전송 (추정 대역폭을 processing_rate로 전달)
-    // buffer_available=1000, last_completed=0, in_progress=0, loss=0, rate=추정대역폭
-    let initial_fc = FlowControlMessage::new(1000, 0, 0, 0.0, estimated_bandwidth_mbps as f32);
+    // 초기 FlowControl 전송 — 아직 실측 데이터 없으므로 rate=0 전송
+    // rate=0이면 서버 BBR이 initial_rate를 유지함 (피드백 없음으로 처리)
+    let initial_fc = FlowControlMessage::new(1000, 0, 0, 0.0, 0.0);
     let _ = send_tx.send(initial_fc.to_bytes()).await;
     
     // 서버에서 받은 설정 정보

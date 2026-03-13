@@ -8,18 +8,31 @@ A UDP-based **NACK-driven block-assembly** transmission protocol implemented in 
 
 ## ⚡ Performance
 
-### Localhost (no network simulation, 50MB)
-| Mode | Send Rate | Receive Rate | NACKs | Redundancy |
-|------|-----------|-------------|-------|------------|
-| Unencrypted | ~285 MB/s | **~70 MB/s** | 0 | 5% (dynamic) |
+### Native (macOS, 10MB)
+| Mode | Throughput | NACKs | Redundancy |
+|------|-----------|-------|------------|
+| Unencrypted | **~260 MB/s** | 0 | 5% (dynamic) |
+| Encrypted (ChaCha20-Poly1305) | **~250 MB/s** | 0 | 5% (dynamic) |
 
-> **Note:** Send rate = BBR-paced sender throughput. Receive rate = end-to-end throughput including segment assembly overhead (46,400 UDP packets). BBR dynamically reduces redundancy from 20% → 5% when loss is near zero, saving bandwidth for useful data.
+### Virtualized (WSL2 on Windows, 10MB)
+| Mode | Throughput | NACKs | Redundancy |
+|------|-----------|-------|------------|
+| Unencrypted | **~65 MB/s** | 0 | 5% (dynamic) |
+| Encrypted (ChaCha20-Poly1305) | **~65 MB/s** | 0 | 5% (dynamic) |
 
-### Simulated network conditions (Linux `tc netem` via network namespaces)
+> **Note:** WSL2 throughput is limited by per-packet syscall overhead (1472-byte UDP datagrams). Native OS avoids this overhead via `recvmmsg` batch receive.
+
+### Cross-network (macOS ↔ WSL2 over WiFi, 10MB)
+| Mode | Throughput | NACKs | RTT | Success |
+|------|-----------|-------|-----|---------|
+| Unencrypted | **~48 MB/s** | 0 | ~5ms | 100% |
+| Encrypted (ChaCha20-Poly1305) | **~48 MB/s** | 0 | ~5ms | 100% |
+
+### Simulated network conditions (Linux `tc netem` via network namespaces, 50MB)
 | Condition | Throughput | NACKs | Success |
 |-----------|-----------|-------|---------|
-| 100ms RTT, 3% loss (encrypted, 50MB) | **~2.9 MB/s** | 2,750 | 100% |
-| 100ms RTT, 5% loss (50MB) | **~3.3 MB/s** | 2,820 | 100% |
+| 100ms RTT, 3% loss (encrypted) | **~1.9 MB/s** | 4,754 | 100% |
+| 100ms RTT, 5% loss | **~1.9 MB/s** | 4,511 | 100% |
 | 100ms RTT, 5% loss (realtime 15s) | **~2.0 MB/s** | 583 | 94.7% |
 
 > **Note:** Loopback (`lo`) does not apply `tc netem` to UDP traffic — use network namespaces + veth pairs for accurate simulation. See [Network Simulation](#-network-simulation-tc-netem) below.
