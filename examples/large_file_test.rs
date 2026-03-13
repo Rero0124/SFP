@@ -782,6 +782,10 @@ async fn run_client(
     let segment_last_chunk_time: Arc<parking_lot::RwLock<HashMap<u64, Instant>>> =
         Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
+    // 완료된 세그먼트 ID 추적 (recv 스레드 ↔ 메인 루프 공유)
+    let assembled_segments: Arc<parking_lot::RwLock<std::collections::HashSet<u64>>> =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashSet::new()));
+
     // SegmentComplete 전송용 crossbeam
     let (complete_tx, complete_rx) = crossbeam_channel::bounded::<Vec<u8>>(1000);
 
@@ -796,6 +800,7 @@ async fn run_client(
     let w_seg_last_time = segment_last_chunk_time.clone();
     let w_start = start;
     let w_raw_bytes = raw_bytes_received.clone();
+    let w_assembled_segs = assembled_segments.clone();
 
     let recv_thread = std::thread::spawn(move || {
 
@@ -901,6 +906,7 @@ async fn run_client(
                     local_assembled.insert(segment_id);
                     segment_buffers.remove(&segment_id);
                     w_assembled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    w_assembled_segs.write().insert(segment_id);
                     let _ = seg_tx.try_send((segment_id, segment_data));
 
                     let elapsed_ms = w_start.elapsed().as_millis() as u64;
@@ -1085,9 +1091,9 @@ async fn run_client(
 
             // 아직 데이터를 전혀 받지 못한 세그먼트 요청
             if nacks_sent < 50 {
+                let completed_set = assembled_segments.read();
                 for seg_id in 1..=expected_segments as u64 {
-                    let is_assembled = assembled_count as u64 >= seg_id; // 간단한 체크
-                    if !is_assembled && !status_map.contains_key(&seg_id) {
+                    if !completed_set.contains(&seg_id) && !status_map.contains_key(&seg_id) {
                         let all_chunks: Vec<u32> = (0..chunks_per_segment as u32).collect();
                         total_chunks_requested += chunks_per_segment as u64;
                         let nack = NackMessage::new(seg_id, all_chunks, 0.0, 0);
