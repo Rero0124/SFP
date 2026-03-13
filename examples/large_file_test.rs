@@ -251,7 +251,6 @@ async fn run_server(
     let fc_bbr = bbr.clone();
     let fc_sending = sending_active.clone();
     let fc_recv_rx = recv_rx.clone();
-    let fc_segment_size = config.segment_size;
     let fc_base_redundancy = config.base_redundancy_ratio;
     let fc_min_redundancy = config.min_redundancy_ratio;
     let fc_max_redundancy = config.max_redundancy_ratio;
@@ -802,7 +801,6 @@ async fn run_client(
     let w_raw_bytes = raw_bytes_received.clone();
 
     let recv_thread = std::thread::spawn(move || {
-        use std::os::unix::io::AsRawFd;
 
         struct SegmentBuffer {
             data: Vec<u8>,
@@ -816,52 +814,41 @@ async fn run_client(
         let mut local_seg_times: HashMap<u64, Instant> = HashMap::new();
         let mut last_snapshot = Instant::now();
 
-        // recvmmsg 배치 크기
+        // 배치 수신 크기
         const BATCH_SIZE: usize = 64;
-        let fd = recv_std_socket.as_raw_fd();
+
+        // 소켓을 non-blocking으로 설정
+        recv_std_socket.set_nonblocking(true).expect("set_nonblocking failed");
 
         // 버퍼 할당 (BATCH_SIZE × 2048 bytes)
         let mut bufs = vec![[0u8; 2048]; BATCH_SIZE];
-        let mut iovecs: Vec<libc::iovec> = Vec::with_capacity(BATCH_SIZE);
-        let mut msghdrs: Vec<libc::mmsghdr> = Vec::with_capacity(BATCH_SIZE);
-
-        // 타임아웃: 50ms
-        let timeout = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
+        let mut recv_lens = vec![0usize; BATCH_SIZE];
 
         loop {
             if !w_running.load(std::sync::atomic::Ordering::Relaxed) {
                 break;
             }
 
-            // iovec/mmsghdr 초기화
-            iovecs.clear();
-            msghdrs.clear();
+            // non-blocking recv 루프로 배치 수신 (크로스 플랫폼)
+            let mut n = 0usize;
             for i in 0..BATCH_SIZE {
-                iovecs.push(libc::iovec {
-                    iov_base: bufs[i].as_mut_ptr() as *mut libc::c_void,
-                    iov_len: bufs[i].len(),
-                });
-            }
-            for i in 0..BATCH_SIZE {
-                let mut hdr: libc::mmsghdr = unsafe { std::mem::zeroed() };
-                hdr.msg_hdr.msg_iov = &mut iovecs[i] as *mut libc::iovec;
-                hdr.msg_hdr.msg_iovlen = 1;
-                msghdrs.push(hdr);
+                match recv_std_socket.recv(&mut bufs[i]) {
+                    Ok(len) => {
+                        recv_lens[i] = len;
+                        n += 1;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        break;
+                    }
+                    Err(_) => {
+                        break;
+                    }
+                }
             }
 
-            // recvmmsg 시스템 콜 (배치 수신)
-            let n = unsafe {
-                libc::recvmmsg(
-                    fd,
-                    msghdrs.as_mut_ptr(),
-                    BATCH_SIZE as libc::c_uint,
-                    libc::MSG_WAITFORONE,
-                    &timeout as *const libc::timespec as *mut libc::timespec,
-                )
-            };
-
-            if n <= 0 {
-                // 타임아웃 또는 에러
+            if n == 0 {
+                // 수신할 데이터 없음 — 잠시 대기 후 재시도
+                std::thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
 
@@ -870,14 +857,14 @@ async fn run_client(
 
             // raw 수신 바이트 카운트 (파싱 전, 순수 소켓 수신량)
             let mut batch_bytes = 0u64;
-            for i in 0..n as usize {
-                batch_bytes += msghdrs[i].msg_len as u64;
+            for i in 0..n {
+                batch_bytes += recv_lens[i] as u64;
             }
             w_raw_bytes.fetch_add(batch_bytes, std::sync::atomic::Ordering::Relaxed);
 
             // 배치 내 각 패킷 처리
-            for i in 0..n as usize {
-                let len = msghdrs[i].msg_len as usize;
+            for i in 0..n {
+                let len = recv_lens[i];
                 let data = &bufs[i][..len];
 
                 // 수동 헤더 파싱
