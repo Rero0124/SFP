@@ -160,7 +160,7 @@ impl BbrLite {
 
         // 1. 송신자 측 delivery rate 계산 (bytes/sec)
         let delivered = self.delivered_bytes.saturating_sub(self.delivered_prev);
-        let sender_delivery_rate = if dt > 0.0 && delivered > 0 {
+        let _sender_delivery_rate = if dt > 0.0 && delivered > 0 {
             delivered as f64 / dt
         } else {
             0.0
