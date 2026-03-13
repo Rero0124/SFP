@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tc qdisc:*)",
+      "Bash(tc -s qdisc show dev lo)"
+    ]
+  }
+}

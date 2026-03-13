@@ -350,7 +350,7 @@ impl InitAckMessage {
             .map(|d| d.as_micros() as u64)
             .unwrap_or(0);
         
-        let chunks_per_segment = (segment_size as usize / chunk_size as usize) as u32;
+        let chunks_per_segment = ((segment_size as usize + chunk_size as usize - 1) / chunk_size as usize) as u32;
         let total_segments = (total_file_size + segment_size as u64 - 1) / segment_size as u64;
         
         Self {
