@@ -40,6 +40,12 @@ pub enum MessageType {
     /// 흐름 제어 피드백 (클라이언트 → 서버)
     FlowControl = 10,
 
+    /// 전송 완료 신호 (서버 → 클라이언트)
+    TransmissionComplete = 11,
+
+    /// 전송 진행 상황 (서버 → 클라이언트, 정확한 loss 계산용)
+    SendProgress = 12,
+
 }
 
 /// 메시지 헤더
@@ -515,6 +521,106 @@ impl FlowControlMessage {
     }
 }
 
+/// 전송 진행 메시지 (서버 → 클라이언트)
+///
+/// 서버가 주기적으로 보내어 클라이언트가 정확한 loss rate를 계산할 수 있게 함
+/// loss = (total_chunks_sent - client_received) / total_chunks_sent
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendProgressMessage {
+    /// 서버가 보낸 총 청크 수 (중복 포함)
+    pub total_chunks_sent: u64,
+    /// 현재까지 전송한 세그먼트 수
+    pub segments_sent: u64,
+}
+
+impl SendProgressMessage {
+    pub fn new(total_chunks_sent: u64, segments_sent: u64) -> Self {
+        Self { total_chunks_sent, segments_sent }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::SendProgress, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 10 {
+            return None;
+        }
+        let header: MessageHeader = bincode::deserialize(bytes).ok()?;
+        if header.msg_type != MessageType::SendProgress {
+            return None;
+        }
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+        if bytes.len() < header_size {
+            return None;
+        }
+        bincode::deserialize(&bytes[header_size..]).ok()
+    }
+}
+
+/// 전송 완료 메시지 (서버 → 클라이언트)
+///
+/// 서버가 모든 세그먼트의 1차 전송을 완료했음을 알림
+/// 클라이언트는 이 메시지 수신 후부터 NACK를 시작
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransmissionCompleteMessage {
+    /// 전송한 총 세그먼트 수
+    pub total_segments: u64,
+    /// 전송한 총 청크 수 (중복 포함)
+    pub total_chunks_sent: u64,
+    /// 타임스탬프
+    pub timestamp_us: u64,
+}
+
+impl TransmissionCompleteMessage {
+    pub fn new(total_segments: u64, total_chunks_sent: u64) -> Self {
+        let timestamp_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        Self {
+            total_segments,
+            total_chunks_sent,
+            timestamp_us,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let payload = bincode::serialize(self).unwrap_or_default();
+        let header = MessageHeader::new(MessageType::TransmissionComplete, payload.len() as u32);
+        let header_bytes = bincode::serialize(&header).unwrap_or_default();
+
+        let mut buf = Vec::with_capacity(header_bytes.len() + payload.len());
+        buf.extend_from_slice(&header_bytes);
+        buf.extend_from_slice(&payload);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 10 {
+            return None;
+        }
+        let header: MessageHeader = bincode::deserialize(bytes).ok()?;
+        if header.msg_type != MessageType::TransmissionComplete {
+            return None;
+        }
+        let header_bytes = bincode::serialize(&header).ok()?;
+        let header_size = header_bytes.len();
+        if bytes.len() < header_size {
+            return None;
+        }
+        bincode::deserialize(&bytes[header_size..]).ok()
+    }
+}
+
 /// 통합 메시지 enum
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -524,6 +630,8 @@ pub enum Message {
     InitAck(InitAckMessage),
     Heartbeat(HeartbeatMessage),
     FlowControl(FlowControlMessage),
+    TransmissionComplete(TransmissionCompleteMessage),
+    SendProgress(SendProgressMessage),
     Close,
 }
 
@@ -537,6 +645,8 @@ impl Message {
             Message::InitAck(_) => MessageType::InitAck,
             Message::Heartbeat(_) => MessageType::Heartbeat,
             Message::FlowControl(_) => MessageType::FlowControl,
+            Message::TransmissionComplete(_) => MessageType::TransmissionComplete,
+            Message::SendProgress(_) => MessageType::SendProgress,
             Message::Close => MessageType::Close,
         }
     }

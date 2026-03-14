@@ -24,7 +24,7 @@ use tracing_subscriber::FmtSubscriber;
 use sfp::bbr::BbrLite;
 use sfp::chunk::SegmentBuilder;
 use sfp::crypto::{CryptoSession, EphemeralKeyPair, KeyExchangeMessage};
-use sfp::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage, SegmentCompleteMessage};
+use sfp::message::{FlowControlMessage, InitAckMessage, InitMessage, MessageHeader, MessageType, NackMessage, SegmentCompleteMessage, SendProgressMessage, TransmissionCompleteMessage};
 use sfp::Config;
 
 /// 테스트용 텍스트 데이터 생성
@@ -125,10 +125,12 @@ async fn run_server(
     // send task용 pacing rate (BBR에서 주기적으로 업데이트)
     let send_pacing_rate = Arc::new(std::sync::atomic::AtomicU64::new(10_000_000)); // 10 MB/s 초기값
 
+    // 실제 소켓 전송 카운터 (채널이 아닌 소켓 기준)
+    let socket_data_packets_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let send_counter_clone = socket_data_packets_sent.clone();
+
     let _send_rate_clone = send_pacing_rate.clone();
     let _send_task = tokio::spawn(async move {
-        // 세그먼트 producer가 BBR 기반 pacing으로 enqueue rate 제어
-        // send task는 즉시 전송 (micro-burst 없이 smooth stream)
         loop {
             // 우선순위 큐 먼저 체크
             match priority_rx.try_recv() {
@@ -147,6 +149,7 @@ async fn run_server(
                 }
                 Some((bytes, addr)) = data_rx.recv() => {
                     let _ = send_socket.send_to(&bytes, addr).await;
+                    send_counter_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 else => break,
             }
@@ -467,6 +470,10 @@ async fn run_server(
         b.bytes_per_interval(PACING_INTERVAL)
     };
 
+    // SendProgress: 서버가 보낸 총 청크 수를 주기적으로 클라이언트에 전송
+    let mut server_total_chunks_sent = 0u64;
+    let mut last_progress_send = Instant::now();
+
     for segment_id in 1..=total_segments as u64 {
         let offset = (segment_id as usize - 1) * segment_size;
         let end = (offset + segment_size).min(data.len());
@@ -516,6 +523,7 @@ async fn run_server(
             } else {
                 total_redundant += 1;
             }
+            server_total_chunks_sent += 1;
             interval_bytes_sent += byte_len;
 
             // interval budget 소진 시 → sleep 후 다음 interval
@@ -537,6 +545,14 @@ async fn run_server(
 
         segments_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
+        // SendProgress 전송 (200ms마다) — 소켓 레벨 카운터 사용
+        if last_progress_send.elapsed() > Duration::from_millis(200) {
+            let actual_sent = socket_data_packets_sent.load(std::sync::atomic::Ordering::Relaxed);
+            let progress_msg = SendProgressMessage::new(actual_sent, segment_id);
+            let _ = priority_tx.try_send((progress_msg.to_bytes(), client_addr));
+            last_progress_send = Instant::now();
+        }
+
         if segment_id % 100 == 0 || segment_id == total_segments as u64 {
             let progress = (segment_id as f64 / total_segments as f64) * 100.0;
             let elapsed = start.elapsed().as_secs_f64();
@@ -553,6 +569,18 @@ async fn run_server(
         let mut b = bbr.lock().await;
         b.on_packet_sent(interval_bytes_sent);
     }
+
+    // TransmissionComplete 메시지 전송 (클라이언트에게 1차 전송 완료 알림)
+    let tc_msg = TransmissionCompleteMessage::new(
+        total_segments as u64,
+        (total_chunks + total_redundant) as u64,
+    );
+    // 여러 번 보내서 손실 방지
+    for _ in 0..3 {
+        let _ = priority_tx.send((tc_msg.to_bytes(), client_addr)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    info!("📤 TransmissionComplete 전송 (세그먼트: {}, 청크: {})", total_segments, total_chunks + total_redundant);
 
     // 전송 완료
     sending_active.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -802,6 +830,9 @@ async fn run_client(
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let raw_bytes_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let unique_bytes_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let transmission_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let server_chunks_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let total_data_packets = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 완료된 세그먼트 데이터를 메인으로 전달
     let (seg_tx, seg_rx) = crossbeam_channel::bounded::<(u64, Vec<u8>)>(1000);
@@ -831,6 +862,9 @@ async fn run_client(
     let w_raw_bytes = raw_bytes_received.clone();
     let w_unique_bytes = unique_bytes_received.clone();
     let w_assembled_segs = assembled_segments.clone();
+    let w_tx_complete = transmission_complete.clone();
+    let w_server_sent = server_chunks_sent.clone();
+    let w_data_packets = total_data_packets.clone();
 
     let recv_thread = std::thread::spawn(move || {
 
@@ -898,6 +932,22 @@ async fn run_client(
             for i in 0..n {
                 let len = recv_lens[i];
                 let data = &bufs[i][..len];
+
+                // protocol 메시지 감지 (bincode MessageHeader는 MAGIC_NUMBER로 시작)
+                if data.len() >= 4 {
+                    let maybe_magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                    if maybe_magic == sfp::MAGIC_NUMBER {
+                        if TransmissionCompleteMessage::from_bytes(data).is_some() {
+                            w_tx_complete.store(true, std::sync::atomic::Ordering::Relaxed);
+                        } else if let Some(progress) = SendProgressMessage::from_bytes(data) {
+                            w_server_sent.store(progress.total_chunks_sent, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        continue; // protocol 메시지는 청크 파서로 넘기지 않음
+                    }
+                }
+
+                // 데이터 패킷 카운트 (중복 포함, loss 계산용)
+                w_data_packets.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
                 // 수동 헤더 파싱
                 if data.len() < 2 + 16 { continue; }
@@ -1018,7 +1068,7 @@ async fn run_client(
     let mut flow_control_time = Instant::now();
     let mut prev_raw_bytes_fc = 0u64;
     let mut prev_fc_elapsed = 0.0f64;
-    let mut periodic_nack_time = Instant::now();
+    let mut tx_complete_logged = false;
 
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1043,42 +1093,18 @@ async fn run_client(
             last_progress_time = Instant::now();
         }
 
-        // 흐름 제어 메시지 전송 (200ms마다) - stale 세그먼트만 손실로 카운트
+        // 흐름 제어 메시지 전송 (200ms마다)
         if flow_control_time.elapsed() > Duration::from_millis(200) {
             let status_map = segment_status_snapshot.read();
-            let seg_times = segment_last_chunk_time.read();
             let incomplete_segments = status_map.len();
-            let now_fc = Instant::now();
 
-            // 최근 세그먼트만 loss 계산 (오래된 Startup 잔여 세그먼트 제외)
-            let max_seg_id = status_map.keys().max().copied().unwrap_or(0);
-            let min_recent_seg = max_seg_id.saturating_sub(100); // 최근 100개만
-
-            let assembled_set = assembled_segments.read();
-            let mut total_expected = 0u64;
-            let mut total_missing = 0u64;
-            for (seg_id, (received_bits, total)) in status_map.iter() {
-                // 이미 완료된 세그먼트는 loss 계산에서 제외 (스냅샷 지연으로 인한 오탐 방지)
-                if assembled_set.contains(seg_id) { continue; }
-                // 오래된 세그먼트는 loss 계산에서 제외
-                if *seg_id < min_recent_seg { continue; }
-                if !received_bits.iter().all(|&r| r) {
-                    let stale_dur = seg_times.get(seg_id)
-                        .map(|t| now_fc.duration_since(*t));
-                    // 300ms~2s 사이만 loss로 카운트
-                    let is_recent_stale = stale_dur
-                        .map(|d| d > Duration::from_millis(300) && d < Duration::from_secs(2))
-                        .unwrap_or(false);
-                    if is_recent_stale {
-                        let expected = *total as u64;
-                        let received = received_bits.iter().filter(|&&r| r).count() as u64;
-                        total_expected += expected;
-                        total_missing += expected.saturating_sub(received);
-                    }
-                }
-            }
-            let loss_rate = if total_expected > 0 {
-                (total_missing as f32 / total_expected as f32).min(1.0)
+            // 정확한 loss 계산: 서버 소켓 전송 수 vs 클라이언트 수신 수 (중복 포함)
+            let srv_sent = server_chunks_sent.load(std::sync::atomic::Ordering::Relaxed);
+            let cli_received = total_data_packets.load(std::sync::atomic::Ordering::Relaxed);
+            let loss_rate = if srv_sent > 100 {
+                // 최소 100개 이상 보내야 유의미한 loss 계산
+                let lost = srv_sent.saturating_sub(cli_received);
+                (lost as f32 / srv_sent as f32).min(1.0)
             } else {
                 0.0
             };
@@ -1115,33 +1141,25 @@ async fn run_client(
             break;
         }
 
-        // NACK 전송: 두 가지 트리거
-        // 1) 데이터가 잠시 안오면 (기존: 200ms 갭)
-        // 2) 주기적 (300ms마다) — 벌크 전송 중에도 누락 청크 복구
-        let nack_gap_trigger = last_chunk_age_dur > Duration::from_millis(200);
-        let nack_periodic_trigger = periodic_nack_time.elapsed() > Duration::from_millis(100);
+        // NACK 전송: TransmissionComplete 수신 후에만 실행
+        // 서버가 1차 전송을 완료한 뒤 누락된 청크만 요청 (이중 전송 방지)
+        let is_tx_complete = transmission_complete.load(std::sync::atomic::Ordering::Relaxed);
 
-        if nack_gap_trigger || nack_periodic_trigger {
+        if is_tx_complete && !tx_complete_logged {
+            info!("📬 TransmissionComplete 수신 — NACK 시작");
+            tx_complete_logged = true;
+        }
+
+        if is_tx_complete && last_chunk_age_dur > Duration::from_millis(50) {
             let status_map = segment_status_snapshot.read();
-            let seg_times = segment_last_chunk_time.read();
             let nack_assembled = assembled_segments.read();
-            let now_nack = Instant::now();
 
             let mut nacks_sent = 0;
             let mut total_chunks_requested = 0u64;
 
             for (segment_id, (received_bits, total_chunks)) in status_map.iter() {
-                // 이미 완료된 세그먼트는 NACK 불필요
                 if nack_assembled.contains(segment_id) { continue; }
                 if !received_bits.iter().all(|&r| r) {
-                    // 주기적 NACK: 200ms 이상 stale한 세그먼트만 (아직 수신 중인 건 제외)
-                    if nack_periodic_trigger && !nack_gap_trigger {
-                        let is_stale = seg_times.get(segment_id)
-                            .map(|t| now_nack.duration_since(*t) > Duration::from_millis(200))
-                            .unwrap_or(true);
-                        if !is_stale { continue; }
-                    }
-
                     let missing: Vec<u32> = (0..*total_chunks)
                         .filter(|&i| i < received_bits.len() as u32 && !received_bits[i as usize])
                         .collect();
@@ -1157,8 +1175,8 @@ async fn run_client(
                 }
             }
 
-            // 아직 데이터를 전혀 받지 못한 세그먼트 요청 (갭 트리거에서만)
-            if nack_gap_trigger && nacks_sent < 50 {
+            // 아직 데이터를 전혀 받지 못한 세그먼트 요청
+            if nacks_sent < 50 {
                 for seg_id in 1..=expected_segments as u64 {
                     if !nack_assembled.contains(&seg_id) && !status_map.contains_key(&seg_id) {
                         let all_chunks: Vec<u32> = (0..chunks_per_segment as u32).collect();
@@ -1175,7 +1193,6 @@ async fn run_client(
             if nacks_sent > 0 {
                 info!("📨 NACK: {}개 세그먼트 / {}개 청크 요청", nacks_sent, total_chunks_requested);
             }
-            periodic_nack_time = Instant::now();
         }
 
         // 10초간 새 데이터 없고 95% 이상 받았으면 종료

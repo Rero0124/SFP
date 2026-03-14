@@ -69,7 +69,7 @@ impl BbrLite {
             state: BbrState::Startup,
             state_start: now,
             bw_samples: VecDeque::new(),
-            bw_window_secs: 3.0, // 3초 윈도우 (빠른 수렴)
+            bw_window_secs: 3.0, // 3초 윈도우
             min_rtt_timestamp: now,
             rtt_sample_count: 0,
             loss_rate: 0.0,
@@ -190,9 +190,7 @@ impl BbrLite {
         // 6. pacing_rate 계산: max_bw * gain
         let target_rate = self.max_bw * gain;
 
-        // 7. 손실은 rate 조정에 사용하지 않음 (redundancy만 조절)
-        //    BBR 본래 설계: 대역폭 기반 rate 제어, 손실은 redundancy로 대응
-        //    loss_factor로 rate를 줄이면 max_bw도 함께 줄어 회복 불가능한 death spiral 발생
+        // 7. rate는 max_bw * gain으로만 결정 (loss는 redundancy로 대응)
         let adjusted_rate = target_rate;
 
         // 8. pacing_rate 업데이트
