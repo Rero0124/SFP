@@ -8,34 +8,21 @@ A UDP-based **NACK-driven block-assembly** transmission protocol implemented in 
 
 ## ⚡ Performance
 
-### Native (macOS, 10MB)
+### Native (macOS, 4GB)
 | Mode | Throughput | NACKs | Redundancy |
 |------|-----------|-------|------------|
-| Unencrypted | **~260 MB/s** | 0 | 5% (dynamic) |
-| Encrypted (ChaCha20-Poly1305) | **~250 MB/s** | 0 | 5% (dynamic) |
+| Unencrypted | **~200 MB/s** | 0 | 5% (dynamic) |
+| Encrypted (ChaCha20-Poly1305) | **~200 MB/s** | 0 | 5% (dynamic) |
 
-### Virtualized (WSL2 on Windows, 10MB)
-| Mode | Throughput | NACKs | Redundancy |
-|------|-----------|-------|------------|
-| Unencrypted | **~65 MB/s** | 0 | 5% (dynamic) |
-| Encrypted (ChaCha20-Poly1305) | **~65 MB/s** | 0 | 5% (dynamic) |
+### Cross-network (macOS ↔ macOS over WiFi, 2GB)
+| Mode | Throughput | Network Bandwidth | NACKs | Redundancy |
+|------|-----------|-------------------|-------|------------|
+| Unencrypted | **~11 MB/s** | ~11 MB/s | 0 | 5% (dynamic) |
+| Encrypted (ChaCha20-Poly1305) | **~12 MB/s** | ~12 MB/s | 0 | 5% (dynamic) |
 
-> **Note:** WSL2 throughput is limited by per-packet syscall overhead (1472-byte UDP datagrams). Native OS avoids this overhead via `recvmmsg` batch receive.
-
-### Cross-network (macOS ↔ WSL2 over WiFi, 10MB)
-| Mode | Throughput | NACKs | RTT | Success |
-|------|-----------|-------|-----|---------|
-| Unencrypted | **~48 MB/s** | 0 | ~5ms | 100% |
-| Encrypted (ChaCha20-Poly1305) | **~48 MB/s** | 0 | ~5ms | 100% |
-
-### Simulated network conditions (Linux `tc netem` via network namespaces, 50MB)
-| Condition | Throughput | NACKs | Success |
-|-----------|-----------|-------|---------|
-| 100ms RTT, 3% loss (encrypted) | **~1.9 MB/s** | 4,754 | 100% |
-| 100ms RTT, 5% loss | **~1.9 MB/s** | 4,511 | 100% |
-| 100ms RTT, 5% loss (realtime 15s) | **~2.0 MB/s** | 583 | 94.7% |
-
-> **Note:** Loopback (`lo`) does not apply `tc netem` to UDP traffic — use network namespaces + veth pairs for accurate simulation. See [Network Simulation](#-network-simulation-tc-netem) below.
+> **Note:** Cross-network throughput matches iperf3-measured WiFi bandwidth — SFP achieves near-100% link utilization.
+>
+> **Note:** Native throughput is currently bottlenecked by BBR pacing (not yet fully optimized). Raw protocol capacity is significantly higher.
 
 ---
 
@@ -263,34 +250,33 @@ Key exchange via X25519 ECDH during handshake. Per-segment symmetric encryption 
 | State | Gain | Description |
 |-------|------|-------------|
 | Startup | 2.0x | Initial bandwidth discovery (max 2s) |
-| ProbeUp | 1.25x | Periodic bandwidth re-probing |
-| ProbeDrain | 0.75x | Queue drainage after probing |
+| ProbeUp | 1.5x | Aggressive bandwidth re-probing |
+| ProbeDrain | 0.5x | Fast queue drainage after probing |
 | Cruise | 1.0x | Steady-state operation |
 
 Key features:
-- **Windowed max bandwidth**: Tracks maximum delivery rate over a 10-second sliding window (prevents EWMA death spiral)
-- **Loss-based rate control**: Rate reduction under loss (1%/5%/10%/20%) + **rate boost when loss < 0.1%** (actively explores higher bandwidth)
+- **Windowed max bandwidth**: Tracks maximum delivery rate over a 2-second sliding window (fast adaptation to bandwidth changes)
+- **Gain-based rate control**: Rate determined purely by `max_bw × gain` — loss is handled by dynamic redundancy, not rate reduction
 - **Dynamic redundancy**: `recommended_redundancy()` reduces redundancy to minimum when loss-free, scales up under loss
-- **Adaptive probing**: Cruise → ProbeUp interval shortens when loss is low (2s vs 5s), enabling faster bandwidth discovery
+- **Adaptive probing**: Cruise → ProbeUp interval shortens when loss is low (1s vs 3s), enabling faster bandwidth discovery
 - **FlowControl feedback**: Client reports loss rate, processing rate, queue depth → server adjusts BBR
 
 ### 4. Dynamic Redundancy
 
-BBR's `recommended_redundancy()` automatically scales redundancy based on loss:
+BBR's `recommended_redundancy()` automatically scales redundancy based on loss (NACK handles the rest):
 
 ```
 loss < 0.1% → min_redundancy (bandwidth saved for speed)
-loss 0.1~1% → gradual interpolation between min and base
-loss 1~5%   → base + loss × 1.5 (gradual increase)
-loss 5~20%  → base + loss × 2.5 (aggressive increase)
-loss > 20%  → base + loss × 3.0 (maximum protection)
+loss 0.1~5% → loss × 1.5 (proportional to loss rate)
+loss 5~15%  → loss × 1.2 (NACK supplements recovery)
+loss > 15%  → max_redundancy
 ```
 
-Example with 5% loss and base_redundancy=15%:
-- `0.15 + 0.05 × 2.5 = 0.275` → 27.5% redundancy
+Example with 5% loss (min=5%, max=70%):
+- `0.05 × 1.2 = 0.06` → 6% redundancy (NACK recovers the rest)
 
-Example on localhost (0% loss, min=5%, base=20%):
-- Redundancy drops to 5%, saving 15% bandwidth for actual data
+Example on localhost (0% loss, min=5%):
+- Redundancy stays at 5%, maximizing bandwidth for actual data
 
 ### 5. Backpressure
 Queue-capacity based flow control prevents sender from overwhelming the receiver:
@@ -306,35 +292,6 @@ The `realtime_test` example demonstrates continuous frame-based transmission:
 - Per-frame latency measurement (P50/P99)
 - Dynamic redundancy adjusts per-frame based on BBR loss detection
 - End-to-end latency tracking via embedded timestamps
-
----
-
-## 📊 Test Results
-
-### Bulk Transfer (50MB, veth, 50ms RTT, 5% loss)
-```
-✅ 수신 완료!
-   시간: 14.03s
-   세그먼트: 800/800
-   전송 성공률: 100.00%
-   처리량: 3.56 MB/s
-   NACK 전송 횟수: 1,007
-   BBR: Cruise, redundancy 20%→26% (dynamic)
-```
-
-### Real-time Streaming (15s, veth, 50ms RTT, 5% loss)
-```
-🏁 실시간 스트리밍 완료
-   프레임: 533 전송
-   완료 확인: 506/533 (94.9%)
-   평균 속도: 1.26 MB/s
-   재전송: 1,644 청크
-   BBR redundancy: 15%↔57% (dynamic)
-
-🏁 실시간 수신 완료
-   프레임 수신: 529
-   지연 시간: avg 811ms, P50 650ms, P99 5939ms
-```
 
 ---
 
