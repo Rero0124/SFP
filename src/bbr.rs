@@ -62,14 +62,14 @@ impl BbrLite {
             pacing_rate: initial_rate,
             min_rtt: initial_rtt,
             last_rtt: initial_rtt,
-            max_bw: initial_rate,
+            max_bw: 1_000_000.0, // min_rate - 수신자 피드백으로 업데이트
             delivered_bytes: 0,
             delivered_prev: 0,
             last_ts: now,
             state: BbrState::Startup,
             state_start: now,
             bw_samples: VecDeque::new(),
-            bw_window_secs: 10.0, // 10초 윈도우
+            bw_window_secs: 3.0, // 3초 윈도우 (빠른 수렴)
             min_rtt_timestamp: now,
             rtt_sample_count: 0,
             loss_rate: 0.0,
@@ -103,7 +103,7 @@ impl BbrLite {
     /// 손실률 업데이트
     pub fn on_loss_update(&mut self, loss_rate: f64) {
         // EWMA로 손실률 평활화
-        self.loss_rate = self.loss_rate * 0.7 + loss_rate * 0.3;
+        self.loss_rate = self.loss_rate * 0.5 + loss_rate * 0.5;
     }
 
     /// 수신자 측 delivery rate 업데이트 (FlowControl 기반)
@@ -181,8 +181,8 @@ impl BbrLite {
 
         // 5. 상태별 gain 결정
         let gain = match self.state {
-            BbrState::Startup => 2.5,     // 빠른 대역폭 탐색
-            BbrState::ProbeUp => 1.5,     // 적극적 대역폭 재탐색
+            BbrState::Startup => 1.25,    // 완만한 대역폭 탐색
+            BbrState::ProbeUp => 1.25,    // 완만한 대역폭 재탐색
             BbrState::ProbeDrain => 0.75, // 큐 배출
             BbrState::Cruise => 1.0,      // 안정 유지
         };
@@ -190,22 +190,10 @@ impl BbrLite {
         // 6. pacing_rate 계산: max_bw * gain
         let target_rate = self.max_bw * gain;
 
-        // 7. 손실 기반 rate 조정
-        //    - 손실 있으면 target_rate (max_bw 기반)에서 감쇄
-        //    - 손실 없으면 target_rate로 설정 (max_bw가 수신자 실측 대역폭이므로 정확)
-        let loss_factor = if self.loss_rate > 0.2 {
-            0.5
-        } else if self.loss_rate > 0.1 {
-            0.7
-        } else if self.loss_rate > 0.05 {
-            0.85
-        } else if self.loss_rate > 0.01 {
-            0.95
-        } else {
-            1.0 // 손실 없으면 target_rate 그대로
-        };
-
-        let adjusted_rate = target_rate * loss_factor;
+        // 7. 손실은 rate 조정에 사용하지 않음 (redundancy만 조절)
+        //    BBR 본래 설계: 대역폭 기반 rate 제어, 손실은 redundancy로 대응
+        //    loss_factor로 rate를 줄이면 max_bw도 함께 줄어 회복 불가능한 death spiral 발생
+        let adjusted_rate = target_rate;
 
         // 8. pacing_rate 업데이트
         //    손실 없고 수신자 피드백이 있으면 빠르게 수렴 (자기참조 순환 아님)
@@ -231,10 +219,14 @@ impl BbrLite {
 
         match self.state {
             BbrState::Startup => {
-                // Startup → Cruise: 충분히 빠르거나 손실 발생
+                // Startup → ProbeDrain: 충분히 탐색했거나 손실/큐잉 감지
                 if state_duration > 2.0 || self.loss_rate > 0.05 || queue_ratio > 2.0 {
-                    self.state = BbrState::Cruise;
+                    self.state = BbrState::ProbeDrain;
                     self.state_start = Instant::now();
+                    // max_bw를 수신자 피드백으로 보정 (샘플은 유지하되 과도한 값 억제)
+                    if self.receiver_delivery_rate > 0.0 && self.max_bw > self.receiver_delivery_rate * 2.0 {
+                        self.max_bw = self.receiver_delivery_rate * 1.5;
+                    }
                 }
             }
             BbrState::ProbeUp => {
@@ -311,35 +303,29 @@ impl BbrLite {
     }
 
     /// 손실률 기반 동적 redundancy 비율 계산
-    /// - loss < 0.1%: min_redundancy로 감소 (대역폭 확보)
-    /// - loss < 1%: base_redundancy에서 점진 감소
-    /// - loss 1~5%: base + loss * 1.5 (완만한 증가)
-    /// - loss 5~20%: base + loss * 2.5 (적극적 증가)
-    /// - loss > 20%: max_redundancy에 가까이
-    pub fn recommended_redundancy(&self, base: f64, min: f64, max: f64) -> f64 {
-        // 수신자 피드백 없으면 base redundancy 유지 (피드백 전에 min으로 낮추지 않음)
+    /// NACK가 빠지는 청크를 복구하므로 redundancy는 보수적으로 유지
+    /// - loss < 0.1%: min_redundancy (대역폭 확보)
+    /// - loss 0.1~5%: loss_rate * 1.5 (손실률에 비례, base 미적용)
+    /// - loss 5~15%: loss_rate * 1.2 (NACK 보완)
+    /// - loss > 15%: max_redundancy
+    pub fn recommended_redundancy(&self, _base: f64, min: f64, max: f64) -> f64 {
+        // 수신자 피드백 없으면 min redundancy (피드백 전에 과다 중복 방지)
         if self.receiver_delivery_rate <= 0.0 {
-            return base;
+            return min;
         }
         if self.loss_rate < 0.001 {
-            // 손실이 거의 없으면 redundancy를 최소로 → 대역폭을 속도에 활용
             return min;
         }
 
-        let multiplier = if self.loss_rate > 0.20 {
-            3.0
+        // 손실률에 비례한 redundancy (base를 더하지 않음 — NACK가 나머지 복구)
+        let ratio = if self.loss_rate > 0.15 {
+            max
         } else if self.loss_rate > 0.05 {
-            2.5
-        } else if self.loss_rate > 0.01 {
-            1.5
+            self.loss_rate * 1.2
         } else {
-            // loss 0.1%~1%: base에서 점진 감소
-            // loss가 0.001에 가까울수록 min에 가깝게
-            let t = (self.loss_rate - 0.001) / (0.01 - 0.001); // 0~1 범위
-            return base * t + min * (1.0 - t);
+            self.loss_rate * 1.5
         };
 
-        let ratio = base + (self.loss_rate * multiplier);
         ratio.clamp(min, max)
     }
 }

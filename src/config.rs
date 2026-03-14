@@ -60,7 +60,7 @@ impl Default for Config {
             chunk_size: DEFAULT_CHUNK_SIZE,
             segment_size: DEFAULT_SEGMENT_SIZE,
             base_redundancy_ratio: 0.15,      // 15% 기본 중복
-            max_redundancy_ratio: 0.70,       // 최대 70%
+            max_redundancy_ratio: 0.25,       // 최대 25% (NACK가 나머지 복구)
             min_redundancy_ratio: 0.05,       // 최소 5%
             nack_timeout_ms: 50,              // 50ms
             segment_timeout_ms: 5000,         // 5초

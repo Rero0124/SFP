@@ -96,7 +96,15 @@ async fn run_server(
     encrypt: bool,
     _num_workers: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let socket = Arc::new(UdpSocket::bind(addr).await?);
+    // 서버 소켓: std로 생성 → 버퍼 설정 → tokio로 변환
+    let std_server_sock = std::net::UdpSocket::bind(addr)?;
+    {
+        let s2 = socket2::SockRef::from(&std_server_sock);
+        let _ = s2.set_send_buffer_size(16 * 1024 * 1024);
+        let _ = s2.set_recv_buffer_size(16 * 1024 * 1024);
+    }
+    std_server_sock.set_nonblocking(true)?;
+    let socket = Arc::new(UdpSocket::from_std(std_server_sock)?);
     info!("📡 서버 시작: {}", addr);
     info!("📦 전송 데이터: {} bytes ({:.2} MB)", data.len(), data.len() as f64 / 1024.0 / 1024.0);
     info!("⚙️  청크 크기: {} bytes", config.chunk_size);
@@ -111,11 +119,16 @@ async fn run_server(
     let (data_tx, mut data_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(200_000);
 
     // ─────────────────────────────────────────────────────────────────
-    // 단일 송신 태스크 (개별 send_to)
+    // 단일 송신 태스크 (send-level pacing으로 micro-burst 억제)
     // ─────────────────────────────────────────────────────────────────
     let send_socket = socket.clone();
+    // send task용 pacing rate (BBR에서 주기적으로 업데이트)
+    let send_pacing_rate = Arc::new(std::sync::atomic::AtomicU64::new(10_000_000)); // 10 MB/s 초기값
 
+    let _send_rate_clone = send_pacing_rate.clone();
     let _send_task = tokio::spawn(async move {
+        // 세그먼트 producer가 BBR 기반 pacing으로 enqueue rate 제어
+        // send task는 즉시 전송 (micro-burst 없이 smooth stream)
         loop {
             // 우선순위 큐 먼저 체크
             match priority_rx.try_recv() {
@@ -239,20 +252,38 @@ async fn run_server(
     );
     let _ = priority_tx.send((ack.to_bytes(), client_addr)).await;
 
+    // RTT 추정: Init 메시지의 client timestamp로 one-way delay 계산
+    // 별도 round-trip 없이 기존 Init 타임스탬프만 활용
+    let estimated_rtt_ms = if client_timestamp > 0 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let server_now_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let one_way_us = server_now_us.saturating_sub(client_timestamp);
+        let rtt_ms = (one_way_us as f64 / 1000.0) * 2.0;
+        // NTP 오차 범위 내 보정: 0.5ms~20ms만 유효 (WiFi 기준)
+        if rtt_ms >= 0.5 && rtt_ms <= 20.0 { rtt_ms } else { 5.0 }
+    } else {
+        5.0 // timestamp 없으면 기본값
+    };
+
+    let initial_rtt = (estimated_rtt_ms / 1000.0).max(0.001); // seconds
+    let initial_rate = 10_000_000.0; // 10 MB/s (BBR Startup이 수신자 피드백으로 수렴)
+    info!("📏 Init timestamp RTT 추정: {:.1}ms → 초기 전송률: {:.1} MB/s", estimated_rtt_ms, initial_rate / 1024.0 / 1024.0);
+
     // 세그먼트 준비 (병렬 처리)
     let segment_builder = Arc::new(SegmentBuilder::new(config.chunk_size));
     let data = Arc::new(data);
     let total_segments = (data.len() + config.segment_size - 1) / config.segment_size;
-    
+
     info!("🚀 전송 시작: {} 세그먼트", total_segments);
 
     // 세그먼트별 청크 저장 (재전송용)
-    let segment_chunks: Arc<RwLock<HashMap<u64, Vec<sfp::chunk::Chunk>>>> = 
+    let segment_chunks: Arc<RwLock<HashMap<u64, Vec<sfp::chunk::Chunk>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // BBR 혼잡 제어
-    let initial_rtt = 0.001; // 1ms
-    let initial_rate = 300_000_000.0; // 300 MB/s
+    // BBR 혼잡 제어 (RTT 기반 초기 설정)
     let _packet_size = config.chunk_size + 100;
     let bbr = Arc::new(tokio::sync::Mutex::new(BbrLite::new(initial_rtt, initial_rate)));
     let segments_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -280,6 +311,7 @@ async fn run_server(
     let disp_base_redundancy = config.base_redundancy_ratio;
     let disp_min_redundancy = config.min_redundancy_ratio;
     let disp_max_redundancy = config.max_redundancy_ratio;
+    let disp_send_rate = send_pacing_rate.clone();
 
     let dispatcher_task = tokio::spawn(async move {
         let mut last_bbr_log = Instant::now();
@@ -316,11 +348,13 @@ async fn run_server(
                         }
                         if fc.segments_in_progress > 0 {
                             let queue_delay = fc.segments_in_progress as f64 * 0.0005;
-                            b.on_rtt_update(0.001 + queue_delay);
+                            b.on_rtt_update(initial_rtt + queue_delay);
                         } else {
-                            b.on_rtt_update(0.001);
+                            b.on_rtt_update(initial_rtt);
                         }
                         b.update_rate();
+                        // send task의 pacing rate 갱신
+                        disp_send_rate.store(b.pacing_rate as u64, std::sync::atomic::Ordering::Relaxed);
                         if last_bbr_log.elapsed() > Duration::from_millis(500) {
                             let dyn_redundancy = b.recommended_redundancy(
                                 disp_base_redundancy, disp_min_redundancy, disp_max_redundancy);
@@ -378,20 +412,32 @@ async fn run_server(
 
                 let cache = chunks_cache.read().await;
                 if let Some(chunks) = cache.get(&nack.segment_id) {
+                    let mut interval_sent = 0usize;
+                    let mut interval_start = Instant::now();
+                    const NACK_PACING_INTERVAL: Duration = Duration::from_millis(20);
+
                     for &chunk_id in &nack.missing_chunk_ids {
                         if let Some(chunk) = chunks.get(chunk_id as usize) {
                             let bytes = chunk.to_bytes();
                             let byte_len = bytes.len();
                             let _ = tx.send((bytes, client_addr)).await;
                             send_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            interval_sent += byte_len;
 
-                            let mut guard = b.lock().await;
-                            guard.on_packet_sent(byte_len);
-                            guard.update_rate();
-                            let budget = guard.bytes_per_interval(Duration::from_millis(10));
-                            drop(guard);
-                            if byte_len >= budget {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            // interval budget 초과 시 sleep (누적 추적)
+                            let budget = {
+                                let mut guard = b.lock().await;
+                                guard.on_packet_sent(byte_len);
+                                guard.update_rate();
+                                guard.bytes_per_interval(NACK_PACING_INTERVAL)
+                            };
+                            if interval_sent >= budget {
+                                let elapsed = interval_start.elapsed();
+                                if elapsed < NACK_PACING_INTERVAL {
+                                    tokio::time::sleep(NACK_PACING_INTERVAL - elapsed).await;
+                                }
+                                interval_sent = 0;
+                                interval_start = Instant::now();
                             }
                         }
                     }
@@ -411,6 +457,15 @@ async fn run_server(
     let base_redundancy = config.base_redundancy_ratio;
     let min_redundancy = config.min_redundancy_ratio;
     let max_redundancy = config.max_redundancy_ratio;
+
+    // 연속 pacing: 세그먼트 경계를 넘어 연속적으로 속도 제어
+    const PACING_INTERVAL: Duration = Duration::from_millis(50);
+    let mut interval_start = Instant::now();
+    let mut interval_bytes_sent = 0usize;
+    let mut bytes_budget = {
+        let b = bbr.lock().await;
+        b.bytes_per_interval(PACING_INTERVAL)
+    };
 
     for segment_id in 1..=total_segments as u64 {
         let offset = (segment_id as usize - 1) * segment_size;
@@ -438,11 +493,9 @@ async fn run_server(
             cache.insert(segment_id, chunks.clone());
         }
 
-        // 청크 전송 (채널에 적재) - 백프레셔 + interval 기반 BBR pacing
+        // 백프레셔: 큐가 너무 차면 대기
         const MIN_CAPACITY: usize = 70_000;
         const RESUME_CAPACITY: usize = 190_000;
-
-        // 큐가 너무 차면 대기 (남은 용량이 적으면)
         while tx.capacity() < MIN_CAPACITY {
             tokio::time::sleep(Duration::from_micros(100)).await;
             if tx.capacity() >= RESUME_CAPACITY {
@@ -450,36 +503,22 @@ async fn run_server(
             }
         }
 
-        // interval 기반 pacing
-        const PACING_INTERVAL: Duration = Duration::from_millis(50);
-
-        // 모든 청크(원본 + redundant) 합치기
+        // 청크 전송 (연속 pacing)
         let all_chunks: Vec<_> = chunks.iter().chain(redundant_chunks.iter()).collect();
-        let mut chunk_idx = 0;
-        let mut interval_start = Instant::now();
-        let mut interval_bytes_sent = 0usize;
 
-        // 이 interval 동안 보낼 수 있는 바이트 수 계산
-        let mut bytes_budget = {
-            let b = bbr.lock().await;
-            b.bytes_per_interval(PACING_INTERVAL)
-        };
-
-        while chunk_idx < all_chunks.len() {
-            let chunk = all_chunks[chunk_idx];
+        for (ci, chunk) in all_chunks.iter().enumerate() {
             let bytes = chunk.to_bytes();
             let byte_len = bytes.len();
             let _ = tx.send((bytes, client_addr)).await;
 
-            if chunk_idx < chunks.len() {
+            if ci < chunks.len() {
                 total_chunks += 1;
             } else {
                 total_redundant += 1;
             }
             interval_bytes_sent += byte_len;
-            chunk_idx += 1;
 
-            // interval budget 소진 시 → 남은 시간 sleep 후 다음 interval
+            // interval budget 소진 시 → sleep 후 다음 interval
             if interval_bytes_sent >= bytes_budget {
                 {
                     let mut b = bbr.lock().await;
@@ -496,12 +535,6 @@ async fn run_server(
             }
         }
 
-        // 잔여 바이트 기록
-        if interval_bytes_sent > 0 {
-            let mut b = bbr.lock().await;
-            b.on_packet_sent(interval_bytes_sent);
-        }
-
         segments_sent.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if segment_id % 100 == 0 || segment_id == total_segments as u64 {
@@ -513,6 +546,12 @@ async fn run_server(
                 progress, segment_id, total_segments, speed, b.state, b.pacing_rate / 1024.0 / 1024.0,
                 redundancy_ratio * 100.0);
         }
+    }
+
+    // 잔여 바이트 기록
+    if interval_bytes_sent > 0 {
+        let mut b = bbr.lock().await;
+        b.on_packet_sent(interval_bytes_sent);
     }
 
     // 전송 완료
@@ -762,6 +801,7 @@ async fn run_client(
     let last_chunk_time = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let raw_bytes_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let unique_bytes_received = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // 완료된 세그먼트 데이터를 메인으로 전달
     let (seg_tx, seg_rx) = crossbeam_channel::bounded::<(u64, Vec<u8>)>(1000);
@@ -789,6 +829,7 @@ async fn run_client(
     let w_seg_last_time = segment_last_chunk_time.clone();
     let w_start = start;
     let w_raw_bytes = raw_bytes_received.clone();
+    let w_unique_bytes = unique_bytes_received.clone();
     let w_assembled_segs = assembled_segments.clone();
 
     let recv_thread = std::thread::spawn(move || {
@@ -887,6 +928,7 @@ async fn run_client(
                     sbuf.received[chunk_id] = true;
                     sbuf.received_count += 1;
                     w_chunks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    w_unique_bytes.fetch_add(chunk_data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                     local_seg_times.insert(segment_id, Instant::now());
                 }
 
@@ -904,8 +946,8 @@ async fn run_client(
                 }
             }
 
-            // 주기적 스냅샷 (500ms마다) - parking_lot RwLock 사용
-            if last_snapshot.elapsed() > Duration::from_millis(500) {
+            // 주기적 스냅샷 (100ms마다) - parking_lot RwLock 사용
+            if last_snapshot.elapsed() > Duration::from_millis(100) {
                 {
                     let mut status = w_seg_status.write();
                     status.clear();
@@ -974,6 +1016,9 @@ async fn run_client(
     let mut nack_count = 0u64;
     let mut last_progress_time = Instant::now();
     let mut flow_control_time = Instant::now();
+    let mut prev_raw_bytes_fc = 0u64;
+    let mut prev_fc_elapsed = 0.0f64;
+    let mut periodic_nack_time = Instant::now();
 
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1005,14 +1050,26 @@ async fn run_client(
             let incomplete_segments = status_map.len();
             let now_fc = Instant::now();
 
+            // 최근 세그먼트만 loss 계산 (오래된 Startup 잔여 세그먼트 제외)
+            let max_seg_id = status_map.keys().max().copied().unwrap_or(0);
+            let min_recent_seg = max_seg_id.saturating_sub(100); // 최근 100개만
+
+            let assembled_set = assembled_segments.read();
             let mut total_expected = 0u64;
             let mut total_missing = 0u64;
             for (seg_id, (received_bits, total)) in status_map.iter() {
+                // 이미 완료된 세그먼트는 loss 계산에서 제외 (스냅샷 지연으로 인한 오탐 방지)
+                if assembled_set.contains(seg_id) { continue; }
+                // 오래된 세그먼트는 loss 계산에서 제외
+                if *seg_id < min_recent_seg { continue; }
                 if !received_bits.iter().all(|&r| r) {
-                    let is_stale = seg_times.get(seg_id)
-                        .map(|t| now_fc.duration_since(*t) > Duration::from_millis(300))
+                    let stale_dur = seg_times.get(seg_id)
+                        .map(|t| now_fc.duration_since(*t));
+                    // 300ms~2s 사이만 loss로 카운트
+                    let is_recent_stale = stale_dur
+                        .map(|d| d > Duration::from_millis(300) && d < Duration::from_secs(2))
                         .unwrap_or(false);
-                    if is_stale {
+                    if is_recent_stale {
                         let expected = *total as u64;
                         let received = received_bits.iter().filter(|&&r| r).count() as u64;
                         total_expected += expected;
@@ -1026,14 +1083,18 @@ async fn run_client(
                 0.0
             };
 
-            // raw 소켓 수신 속도 (bytes/sec) - 파싱과 무관한 순수 수신 대역폭
+            // Rolling window 수신 속도 (이전 FC 이후 수신량 기반)
             let raw_bytes = raw_bytes_received.load(std::sync::atomic::Ordering::Relaxed);
-            let elapsed_secs = start.elapsed().as_secs_f64();
-            let raw_recv_rate = if elapsed_secs > 0.0 {
-                raw_bytes as f32 / elapsed_secs as f32
+            let current_elapsed = start.elapsed().as_secs_f64();
+            let delta_bytes = raw_bytes - prev_raw_bytes_fc;
+            let delta_time = current_elapsed - prev_fc_elapsed;
+            let raw_recv_rate = if delta_time > 0.05 {
+                delta_bytes as f32 / delta_time as f32
             } else {
                 0.0
             };
+            prev_raw_bytes_fc = raw_bytes;
+            prev_fc_elapsed = current_elapsed;
 
             // processing_rate 필드에 raw recv rate (bytes/sec)를 전달
             // 서버 BBR이 실제 수신 대역폭을 알 수 있도록
@@ -1054,15 +1115,33 @@ async fn run_client(
             break;
         }
 
-        // NACK 전송 (데이터가 잠시 안오면)
-        if last_chunk_age_dur > Duration::from_millis(200) {
+        // NACK 전송: 두 가지 트리거
+        // 1) 데이터가 잠시 안오면 (기존: 200ms 갭)
+        // 2) 주기적 (300ms마다) — 벌크 전송 중에도 누락 청크 복구
+        let nack_gap_trigger = last_chunk_age_dur > Duration::from_millis(200);
+        let nack_periodic_trigger = periodic_nack_time.elapsed() > Duration::from_millis(100);
+
+        if nack_gap_trigger || nack_periodic_trigger {
             let status_map = segment_status_snapshot.read();
+            let seg_times = segment_last_chunk_time.read();
+            let nack_assembled = assembled_segments.read();
+            let now_nack = Instant::now();
 
             let mut nacks_sent = 0;
             let mut total_chunks_requested = 0u64;
 
             for (segment_id, (received_bits, total_chunks)) in status_map.iter() {
+                // 이미 완료된 세그먼트는 NACK 불필요
+                if nack_assembled.contains(segment_id) { continue; }
                 if !received_bits.iter().all(|&r| r) {
+                    // 주기적 NACK: 200ms 이상 stale한 세그먼트만 (아직 수신 중인 건 제외)
+                    if nack_periodic_trigger && !nack_gap_trigger {
+                        let is_stale = seg_times.get(segment_id)
+                            .map(|t| now_nack.duration_since(*t) > Duration::from_millis(200))
+                            .unwrap_or(true);
+                        if !is_stale { continue; }
+                    }
+
                     let missing: Vec<u32> = (0..*total_chunks)
                         .filter(|&i| i < received_bits.len() as u32 && !received_bits[i as usize])
                         .collect();
@@ -1078,11 +1157,10 @@ async fn run_client(
                 }
             }
 
-            // 아직 데이터를 전혀 받지 못한 세그먼트 요청
-            if nacks_sent < 50 {
-                let completed_set = assembled_segments.read();
+            // 아직 데이터를 전혀 받지 못한 세그먼트 요청 (갭 트리거에서만)
+            if nack_gap_trigger && nacks_sent < 50 {
                 for seg_id in 1..=expected_segments as u64 {
-                    if !completed_set.contains(&seg_id) && !status_map.contains_key(&seg_id) {
+                    if !nack_assembled.contains(&seg_id) && !status_map.contains_key(&seg_id) {
                         let all_chunks: Vec<u32> = (0..chunks_per_segment as u32).collect();
                         total_chunks_requested += chunks_per_segment as u64;
                         let nack = NackMessage::new(seg_id, all_chunks, 0.0, 0);
@@ -1097,6 +1175,7 @@ async fn run_client(
             if nacks_sent > 0 {
                 info!("📨 NACK: {}개 세그먼트 / {}개 청크 요청", nacks_sent, total_chunks_requested);
             }
+            periodic_nack_time = Instant::now();
         }
 
         // 10초간 새 데이터 없고 95% 이상 받았으면 종료
@@ -1249,7 +1328,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Config::default();
     config.chunk_size = 1200;
     config.segment_size = 65536;  // 64KB
-    config.base_redundancy_ratio = 0.20;  // 20% 중복
+    config.base_redundancy_ratio = 0.10;  // 10% 기본 중복 (NACK가 나머지 복구)
     config.nack_timeout_ms = 100;  // NACK 체크 주기
     config.segment_timeout_ms = 30000;  // 30초 세그먼트 타임아웃
     config.encryption_enabled = encrypt;

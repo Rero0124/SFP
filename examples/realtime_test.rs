@@ -143,11 +143,11 @@ async fn run_server(
     );
     let _ = priority_tx.send((ack.to_bytes(), client_addr)).await;
 
-    // BBR 초기화
+    // BBR 초기화 (보수적 시작 → Startup에서 점진 증가)
     let segment_builder = Arc::new(SegmentBuilder::new(config.chunk_size));
     let _packet_size = config.chunk_size + 100;
-    let initial_rate = target_rate_mbps * 1024.0 * 1024.0;
-    let bbr = Arc::new(Mutex::new(BbrLite::new(0.001, initial_rate)));
+    let initial_rate = (target_rate_mbps * 1024.0 * 1024.0).min(5_000_000.0); // 최대 5MB/s로 시작
+    let bbr = Arc::new(Mutex::new(BbrLite::new(0.005, initial_rate)));
 
     // 세그먼트 청크 캐시 (재전송용)
     let segment_chunks: Arc<RwLock<HashMap<u64, Vec<sfp::chunk::Chunk>>>> =
@@ -198,9 +198,9 @@ async fn run_server(
                         }
                         if fc.segments_in_progress > 0 {
                             let queue_delay = fc.segments_in_progress as f64 * 0.0005;
-                            b.on_rtt_update(0.001 + queue_delay);
+                            b.on_rtt_update(0.005 + queue_delay);
                         } else {
-                            b.on_rtt_update(0.001);
+                            b.on_rtt_update(0.005);
                         }
                         b.update_rate();
 
@@ -649,6 +649,8 @@ async fn run_client(
     let mut last_progress_time = Instant::now();
     let mut flow_control_time = Instant::now();
     let mut last_assembled_count = 0usize;
+    let mut prev_assembled_fc = 0usize;
+    let mut prev_fc_elapsed = 0.0f64;
 
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -695,11 +697,14 @@ async fn run_client(
             let mut total_missing = 0u64;
             for (seg_id, received_chunks) in chunks_map.iter() {
                 if !assembled_set.contains(seg_id) {
-                    let is_stale = seg_times
+                    let stale_dur = seg_times
                         .get(seg_id)
-                        .map(|t| now_fc.duration_since(*t) > Duration::from_millis(300))
+                        .map(|t| now_fc.duration_since(*t));
+                    // 300ms~5s 사이만 loss로 카운트 (너무 오래된 것은 제외)
+                    let is_recent_stale = stale_dur
+                        .map(|d| d > Duration::from_millis(300) && d < Duration::from_secs(5))
                         .unwrap_or(false);
-                    if is_stale {
+                    if is_recent_stale {
                         let expected = totals_map.get(seg_id).copied().unwrap_or(55) as u64;
                         let received = received_chunks.len() as u64;
                         total_expected += expected;
@@ -713,12 +718,18 @@ async fn run_client(
                 0.0
             };
 
-            let elapsed_secs = start.elapsed().as_secs_f64();
-            let processing_rate = if elapsed_secs > 0.0 {
-                assembled_set.len() as f32 / elapsed_secs as f32
+            // Rolling window: 이전 FC 이후 처리량 기반
+            let current_elapsed = start.elapsed().as_secs_f64();
+            let current_assembled = assembled_set.len();
+            let delta_assembled = current_assembled - prev_assembled_fc;
+            let delta_time = current_elapsed - prev_fc_elapsed;
+            let processing_rate = if delta_time > 0.05 {
+                delta_assembled as f32 / delta_time as f32
             } else {
                 0.0
             };
+            prev_assembled_fc = current_assembled;
+            prev_fc_elapsed = current_elapsed;
 
             let fc = FlowControlMessage::new(
                 assembled_set.len() as u32,
