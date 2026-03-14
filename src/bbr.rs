@@ -69,7 +69,7 @@ impl BbrLite {
             state: BbrState::Startup,
             state_start: now,
             bw_samples: VecDeque::new(),
-            bw_window_secs: 3.0, // 3초 윈도우
+            bw_window_secs: 2.0, // 2초 윈도우 (빠른 대역폭 변화 추적)
             min_rtt_timestamp: now,
             rtt_sample_count: 0,
             loss_rate: 0.0,
@@ -179,11 +179,11 @@ impl BbrLite {
         let state_duration = now.duration_since(self.state_start).as_secs_f64();
         self.transition_state(state_duration);
 
-        // 5. 상태별 gain 결정
+        // 5. 상태별 gain 결정 (공격적: 정확한 손실률 기반)
         let gain = match self.state {
-            BbrState::Startup => 1.25,    // 완만한 대역폭 탐색
-            BbrState::ProbeUp => 1.25,    // 완만한 대역폭 재탐색
-            BbrState::ProbeDrain => 0.75, // 큐 배출
+            BbrState::Startup => 2.0,     // 빠른 대역폭 탐색
+            BbrState::ProbeUp => 1.5,     // 적극적 대역폭 재탐색
+            BbrState::ProbeDrain => 0.5,  // 빠른 큐 배출
             BbrState::Cruise => 1.0,      // 안정 유지
         };
 
@@ -196,10 +196,10 @@ impl BbrLite {
         // 8. pacing_rate 업데이트
         //    손실 없고 수신자 피드백이 있으면 빠르게 수렴 (자기참조 순환 아님)
         let alpha = match self.state {
-            BbrState::Startup => 0.9,
-            BbrState::ProbeUp => 0.7,
-            BbrState::ProbeDrain => 0.6,
-            BbrState::Cruise => 0.5,
+            BbrState::Startup => 0.95,   // 즉시 수렴
+            BbrState::ProbeUp => 0.85,   // 빠른 수렴
+            BbrState::ProbeDrain => 0.8,  // 빠른 감속
+            BbrState::Cruise => 0.7,      // 빠른 안정화
         };
         self.pacing_rate = self.pacing_rate * (1.0 - alpha) + adjusted_rate * alpha;
 
@@ -245,11 +245,11 @@ impl BbrLite {
                 // Cruise → ProbeUp: 주기적 대역폭 재탐색
                 // 손실이 낮을수록 더 빈번하게 탐색 (무손실: 2초, 낮은 손실: 5초)
                 let probe_interval = if self.loss_rate < 0.001 {
-                    2.0
+                    1.0  // 무손실: 1초마다 재탐색
                 } else if self.loss_rate < 0.01 {
-                    3.0
+                    2.0
                 } else {
-                    5.0
+                    3.0
                 };
                 if state_duration > probe_interval && self.loss_rate < 0.1 {
                     self.state = BbrState::ProbeUp;
