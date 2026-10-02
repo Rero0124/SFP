@@ -1,0 +1,15 @@
+# Orca worktree 설정 (https://github.com/stablyai/orca)
+# setup: 새 worktree를 만든 직후 실행된다. $ORCA_ROOT_PATH = 원본 체크아웃, $ORCA_WORKTREE_PATH = 새 worktree
+scripts:
+  setup: |
+    # 원본 체크아웃의 gitignore된 .env 파일을 새 worktree에 심볼릭 링크로 공유한다.
+    # 링크라서 어느 worktree에서 고쳐도 원본 파일 하나만 바뀐다.
+    while IFS= read -r -d '' f; do
+      case "${f##*/}" in .env|.env.*|*.env) ;; *) continue ;; esac
+      case "$f" in */|*.bak*|*.orig|*~) continue ;; esac
+      dest="$ORCA_WORKTREE_PATH/$f"
+      if [ -e "$dest" ] || [ -L "$dest" ]; then continue; fi
+      mkdir -p "$(dirname "$dest")"
+      ln -s "$ORCA_ROOT_PATH/$f" "$dest"
+      echo "env 공유: $f"
+    done < <(git -C "$ORCA_ROOT_PATH" ls-files -z --others --ignored --exclude-standard --directory)
